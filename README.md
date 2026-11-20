@@ -11,7 +11,7 @@ which crates.io doesn't carry, as a Git dependency).
 | [fcm_receiver_rs](fcm_receiver_rs) `fc43098` | Android messaging tokens use the Firebase installation ID and auth token; received messages are acknowledged, so they aren't delivered again |
 | [gpui-component](gpui-component) 0.9.1 | Window resize edges over the content |
 | [gpui-mobile](gpui-mobile) `5fd54f4` | Builds against gpui-pre 0.3.12 (Android and iOS) |
-| [imap-proto](imap-proto) 0.10.2 | Gmail FETCH attributes; unmodeled untagged data; builds as a patched dependency; extension data (thread/email ids, PREVIEW, SAVEDATE, BINARY, ESEARCH, SORT, THREAD, VANISHED) |
+| [imap-proto](imap-proto) 0.10.2 | Gmail FETCH attributes; unmodeled untagged data; builds as a patched dependency; extension data (thread/email ids, PREVIEW, SAVEDATE, BINARY, ESEARCH, SORT, THREAD, VANISHED); IMAP4rev2-only servers; UIDONLY's UIDFETCH |
 | [stylo_derive](stylo_derive) 0.22.0 | ToCss explicit error type |
 
 Each folder has the crate (`crate/`), its patches, its license and a README.

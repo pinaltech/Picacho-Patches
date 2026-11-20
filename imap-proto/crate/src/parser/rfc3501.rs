@@ -164,8 +164,13 @@ named!(capability<Capability>, alt!(
     map!(atom, |a| Capability::Atom(a))
 ));
 
+// A server may speak IMAP4rev2 alone (RFC 9051), listing it as an atom.
 fn ensure_capabilities_contains_imap4rev<'a>(capabilities: Vec<Capability<'a>>) -> Result<Vec<Capability<'a>>, ()> {
-    if capabilities.contains(&Capability::Imap4rev1) {
+    let rev2 = capabilities.iter().any(|c| match c {
+        Capability::Atom(a) => a.eq_ignore_ascii_case("IMAP4rev2"),
+        _ => false,
+    });
+    if rev2 || capabilities.contains(&Capability::Imap4rev1) {
         Ok(capabilities)
     } else {
         Err(())
@@ -448,6 +453,24 @@ named!(message_data_fetch<Response>, do_parse!(
     (Response::Fetch(num, attrs))
 ));
 
+// UIDONLY (RFC 9586, Picacho patch): once enabled, the server answers
+// UID FETCH and UID STORE, and reports flag changes, with
+// `* <uid> UIDFETCH (...)`, where the number is the UID and the UID item
+// may be left out. It is reported as a FETCH carrying that UID, so `imap`
+// reads it as it reads a UID FETCH reply; its sequence number is the UID.
+named!(message_data_uidfetch<Response>, do_parse!(
+    uid: number >>
+    tag_no_case!(" UIDFETCH ") >>
+    attrs: msg_att_list >>
+    ({
+        let mut attrs = attrs;
+        if !attrs.iter().any(|a| matches!(a, AttributeValue::Uid(_))) {
+            attrs.insert(0, AttributeValue::Uid(uid));
+        }
+        Response::Fetch(uid, attrs)
+    })
+));
+
 named!(message_data_expunge<Response>, do_parse!(
     num: number >>
     tag_no_case!(" EXPUNGE") >>
@@ -549,6 +572,7 @@ named!(response_data<Response>, do_parse!(
         mailbox_data |
         message_data_expunge |
         message_data_fetch |
+        message_data_uidfetch |
         resp_capability |
         resp_metadata |
         extensions::resp_vanished_now |
@@ -871,10 +895,18 @@ mod tests {
             }
         );
 
-        // Capability command must contain IMAP4rev1
+        // Capability command must contain IMAP4rev1 or IMAP4rev2
         assert_matches!(
             super::capability_data(b"CAPABILITY AUTH=GSSAPI AUTH=PLAIN\r\n"),
             Err(_)
+        );
+        assert_matches!(
+            super::capability_data(b"CAPABILITY IMAP4rev2 CONDSTORE\r\n"),
+            Ok((_, capabilities)) => {
+                assert_eq!(capabilities, vec![
+                    Capability::Atom("IMAP4rev2"), Capability::Atom("CONDSTORE")
+                ])
+            }
         );
     }
 
@@ -883,6 +915,26 @@ mod tests {
         match parse_response(b"* 4644 FETCH (UID ") {
             Err(nom::Err::Incomplete(_)) => {},
             rsp => panic!("should be incomplete: {:?}", rsp),
+        }
+    }
+
+    #[test]
+    fn test_uidfetch() {
+        // RFC 9586: the number is the UID, which the attributes may omit.
+        match parse_response(b"* 4644 UIDFETCH (FLAGS (\\Seen) MODSEQ (12))\r\n") {
+            Ok((rest, Response::Fetch(4644, attrs))) => {
+                assert!(rest.is_empty());
+                assert_eq!(attrs[0], AttributeValue::Uid(4644));
+                assert!(attrs.contains(&AttributeValue::Flags(vec!["\\Seen"])));
+                assert!(attrs.contains(&AttributeValue::ModSeq(12)));
+            }
+            rsp => panic!("unexpected response {:?}", rsp),
+        }
+        match parse_response(b"* 7 uidfetch (UID 7 RFC822.SIZE 120)\r\n") {
+            Ok((_, Response::Fetch(7, attrs))) => {
+                assert_eq!(attrs, vec![AttributeValue::Uid(7), AttributeValue::Rfc822Size(120)]);
+            }
+            rsp => panic!("unexpected response {:?}", rsp),
         }
     }
 
