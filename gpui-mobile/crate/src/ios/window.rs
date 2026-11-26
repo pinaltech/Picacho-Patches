@@ -1020,6 +1020,7 @@ impl IosWindow {
                 KeyboardType::NumberPad => 4,    // UIKeyboardTypeNumberPad
                 KeyboardType::URL => 3,          // UIKeyboardTypeURL
                 KeyboardType::Decimal => 8,      // UIKeyboardTypeDecimalPad
+                KeyboardType::Password => 0,     // UIKeyboardTypeDefault, secure (below)
             };
             log::info!(
                 "GPUI iOS: text_input_view={:p}, setKeyboardType: {}",
@@ -1030,7 +1031,11 @@ impl IosWindow {
                 log::error!("GPUI iOS: text_input_view is NULL!");
                 return;
             }
-            super::text_input::configure_keyboard_traits(self.text_input_view, kb_type);
+            super::text_input::configure_keyboard_traits(
+                self.text_input_view,
+                kb_type,
+                keyboard_type == KeyboardType::Password,
+            );
             log::info!("GPUI iOS: scheduling becomeFirstResponder");
 
             // Defer becomeFirstResponder to the next run-loop iteration.

@@ -977,6 +977,50 @@ impl<'a> TElement for BlitzNode<'a> {
             Some(LengthPercentage::Length(length))
         }
 
+        /// `text` as a quoted CSS string, so that an attribute can't add
+        /// declarations of its own.
+        fn css_string(text: &str) -> String {
+            let mut out = String::with_capacity(text.len() + 2);
+            out.push('"');
+            for c in text.chars() {
+                match c {
+                    '"' | '\\' => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    '\n' | '\r' | '\u{c}' => out.push(' '),
+                    _ => out.push(c),
+                }
+            }
+            out.push('"');
+            out
+        }
+
+        /// The HTML "rules for parsing a legacy font size", as a CSS keyword.
+        /// https://html.spec.whatwg.org/multipage/rendering.html#phrasing-content-3
+        fn legacy_font_size(value: &str) -> Option<&'static str> {
+            let value = value.trim_start_matches(|c: char| c.is_ascii_whitespace());
+            let (mode, digits) = match value.as_bytes().first()? {
+                b'+' => (1, &value[1..]),
+                b'-' => (-1, &value[1..]),
+                _ => (0, value),
+            };
+            let digits: String = digits.chars().take_while(char::is_ascii_digit).collect();
+            let mut size: i64 = digits.get(..digits.len().min(4))?.parse().ok()?;
+            if mode != 0 {
+                size = 3 + mode * size;
+            }
+            Some(match size.clamp(1, 7) {
+                1 => "x-small",
+                2 => "small",
+                3 => "medium",
+                4 => "large",
+                5 => "x-large",
+                6 => "xx-large",
+                _ => "xxx-large",
+            })
+        }
+
         /// Declarations from a snippet of CSS, for attributes that map to
         /// properties which are simplest written as CSS. Invalid ones drop.
         fn css_declarations(css: &str) -> Vec<PropertyDeclaration> {
@@ -1054,15 +1098,116 @@ impl<'a> TElement for BlitzNode<'a> {
 
             if *name == local_name!("align") {
                 use style::values::specified::TextAlign;
-                let keyword = match value {
-                    "left" => Some(StyloTextAlign::MozLeft),
-                    "right" => Some(StyloTextAlign::MozRight),
-                    "center" => Some(StyloTextAlign::MozCenter),
-                    _ => None,
-                };
+                // Attribute keywords match ASCII case-insensitively.
+                let keyword = value.trim().to_ascii_lowercase();
+                let is_replaced = *tag == local_name!("img")
+                    || *tag == local_name!("object")
+                    || *tag == local_name!("embed")
+                    || *tag == local_name!("iframe")
+                    || is_image_input;
+                if *tag == local_name!("table") {
+                    // A table's `align` places the table, not its content:
+                    // left and right float it (the UA sheet), center
+                    // centers it with auto margins.
+                    // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
+                    if keyword == "center" {
+                        for decl in css_declarations("margin-left: auto; margin-right: auto") {
+                            push_style(decl);
+                        }
+                    }
+                } else if is_replaced {
+                    // https://html.spec.whatwg.org/multipage/rendering.html#attributes-for-embedded-content-and-images
+                    let css = match keyword.as_str() {
+                        "left" => Some("float: left"),
+                        "right" => Some("float: right"),
+                        "top" => Some("vertical-align: top"),
+                        "middle" | "absmiddle" | "abscenter" | "center" => {
+                            Some("vertical-align: middle")
+                        }
+                        "bottom" | "baseline" => Some("vertical-align: baseline"),
+                        "texttop" => Some("vertical-align: text-top"),
+                        "absbottom" => Some("vertical-align: bottom"),
+                        _ => None,
+                    };
+                    for decl in css.map(css_declarations).unwrap_or_default() {
+                        push_style(decl);
+                    }
+                } else {
+                    let keyword = match keyword.as_str() {
+                        "left" => Some(TextAlign::Keyword(StyloTextAlign::MozLeft)),
+                        "right" => Some(TextAlign::Keyword(StyloTextAlign::MozRight)),
+                        "center" | "middle" => {
+                            Some(TextAlign::Keyword(StyloTextAlign::MozCenter))
+                        }
+                        "justify" => Some(TextAlign::Keyword(StyloTextAlign::Justify)),
+                        _ => None,
+                    };
 
-                if let Some(keyword) = keyword {
-                    push_style(PropertyDeclaration::TextAlign(TextAlign::Keyword(keyword)));
+                    if let Some(keyword) = keyword {
+                        push_style(PropertyDeclaration::TextAlign(keyword));
+                    }
+                }
+            }
+
+            // `background` on the body and table parts is an image URL.
+            // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
+            if *name == local_name!("background")
+                && (*tag == local_name!("body")
+                    || *tag == local_name!("table")
+                    || *tag == local_name!("thead")
+                    || *tag == local_name!("tbody")
+                    || *tag == local_name!("tfoot")
+                    || *tag == local_name!("tr")
+                    || *tag == local_name!("td")
+                    || *tag == local_name!("th"))
+            {
+                let url = value.trim();
+                if !url.is_empty() {
+                    for decl in css_declarations(&format!(
+                        "background-image: url({})",
+                        css_string(url)
+                    )) {
+                        push_style(decl);
+                    }
+                }
+            }
+
+            // `<font color size face>` and `<body text>`.
+            // https://html.spec.whatwg.org/multipage/rendering.html#phrasing-content-3
+            let is_font = *tag == local_name!("font");
+            if (is_font && *name == local_name!("color"))
+                || (*tag == local_name!("body") && *name == local_name!("text"))
+            {
+                use style::values::specified::Color;
+                if let Ok(color) = style::servo::attr::parse_legacy_color(value) {
+                    push_style(PropertyDeclaration::Color(
+                        style::values::specified::ColorPropertyValue(Color::from_absolute_color(
+                            color,
+                        )),
+                    ));
+                }
+            }
+            if is_font && *name == local_name!("face") {
+                let families: Vec<String> = value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|family| !family.is_empty())
+                    .map(|family| {
+                        css_string(family.trim_matches(|c| c == '"' || c == '\''))
+                    })
+                    .collect();
+                if !families.is_empty() {
+                    for decl in css_declarations(&format!("font-family: {}", families.join(", ")))
+                    {
+                        push_style(decl);
+                    }
+                }
+            }
+            if is_font && *name == local_name!("size") {
+                if let Some(keyword) = legacy_font_size(value) {
+                    for decl in css_declarations(&format!("font-size: {keyword}")) {
+                        push_style(decl);
+                    }
                 }
             }
 
@@ -1257,9 +1402,14 @@ impl<'a> TElement for BlitzNode<'a> {
 
             if *name == local_name!("bgcolor") {
                 use style::values::specified::Color;
-                if let Some((r, g, b, a)) = parse_color_attr(value) {
+                // Emails write `bgcolor="white"` and `bgcolor="ffffff"` as
+                // often as `#ffffff`: the legacy color rules read them all.
+                let color = parse_color_attr(value)
+                    .map(|(r, g, b, a)| AbsoluteColor::srgb_legacy(r, g, b, a))
+                    .or_else(|| style::servo::attr::parse_legacy_color(value).ok());
+                if let Some(color) = color {
                     push_style(PropertyDeclaration::BackgroundColor(
-                        Color::from_absolute_color(AbsoluteColor::srgb_legacy(r, g, b, a)),
+                        Color::from_absolute_color(color),
                     ));
                 }
             }

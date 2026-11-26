@@ -40,6 +40,20 @@ so the crate builds for iOS with default features off.
 
 Remove when upstream builds against the gpui-pre release Picacho uses.
 
+### 0003 Password keyboard
+
+`src/lib.rs`, `src/android/jni.rs`, `src/ios/window.rs` and
+`src/ios/text_input.rs`. `KeyboardType::Password`, for passwords, PINs and
+passphrases. On Android it is the host activity's keyboard type 6, which
+Picacho's `GpuiInputActivity` shows as a password field without suggestions
+and with `IME_FLAG_NO_PERSONALIZED_LEARNING`, so the keyboard doesn't learn
+(or sync) what is typed. On iOS the text view gets secure text entry, no
+spell checking and the password content type, so QuickType keeps nothing
+and AutoFill may offer a saved password. Other keyboard types turn those
+off again.
+
+Remove when upstream has a password keyboard type.
+
 ## Upgrading
 
 Change `commit` in `UPSTREAM`, then:

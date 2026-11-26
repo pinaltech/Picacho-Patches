@@ -66,6 +66,85 @@ root's coordinates rather than the box's.
 Remove when upstream hit-tests inline roots' children against their border
 box.
 
+### 0005 Blocks in tables
+
+`collect_table_cells` in `src/layout/table.rs`. Email templates (Klaviyo's
+among them) lay columns out as `display: table-cell` divs in a
+`display: table` div, and below 480 pixels make the columns
+`display: block` to stack them. A block or inline box directly in a table or
+row group is wrapped in an anonymous row and cell in CSS. Upstream dropped it,
+so on a phone such an email showed almost nothing. Each such box now gets an
+anonymous row of its own and is laid out as its cell (`TableRow::anonymous`,
+whose `node_id` is the box), so restacked columns stack. Unlike CSS,
+consecutive such boxes each get a row rather than sharing one. blitz-paint's
+0002 depends on `TableRow::anonymous`.
+
+Remove when upstream wraps blocks in tables in anonymous rows and cells.
+
+### 0006 Email legacy attributes
+
+`synthesize_presentational_hints_for_legacy_attributes` in `src/stylo.rs`.
+Email HTML is written with the presentational attributes of old HTML, which
+upstream mapped only partly:
+
+- `align` gave every element a `text-align`. On a table it centers or floats
+  the table, not its content: `align="center"` now gives it auto margins
+  (left and right float it, in the UA sheet) and its cells' text stays put.
+  On an image (and other replaced elements) left and right float it and the
+  other keywords set `vertical-align`. Keywords match case-insensitively, and
+  `justify` justifies.
+- `background` on the body and table parts is a background image.
+- `<font color size face>` and `<body text>` set the color, the legacy font
+  size (1 to 7, or relative to 3) and the font family.
+- `bgcolor` read only `#rgb` and `#rrggbb`; it now follows the legacy color
+  rules, so `bgcolor="white"` and `bgcolor="ffffff"` work too.
+
+Attribute values written into CSS are quoted, so an attribute can't add
+declarations of its own.
+
+Remove when upstream maps these attributes.
+
+### 0007 Media device pixel ratio
+
+`make_device` in `src/stylo_device.rs` and
+`BaseDocument::set_media_device_pixel_ratio` in `src/document.rs`. Picacho
+lays emails out in CSS pixels (a viewport scale of 1) and rasterizes them at
+the screen's scale itself, so `resolution` and `-webkit-device-pixel-ratio`
+media queries always saw 1, and emails' sharper images for HiDPI screens were
+never used. The new setter gives `@media` rules the ratio to see without
+changing the layout's scale; `None` keeps upstream's behavior.
+
+Remove when upstream lets the media device pixel ratio differ from the
+layout scale.
+
+### 0008 Media preferences
+
+`BaseDocument::set_media_preferences` (`src/document.rs`), with
+`MediaPreferences` and `Contrast` (`src/stylo_device.rs`, exported): what
+`prefers-reduced-motion` and `prefers-contrast` media queries see (Media
+Queries 5 §11.3, §11.4), from the embedder's or the system's settings. They
+are kept on the document and applied each time the device is rebuilt, as
+0007's pixel ratio is. Needs `stylo` 0001.
+
+Remove when upstream passes these preferences to Stylo.
+
+### 0009 SVG images stay inside
+
+`parse_svg_image` in `src/util.rs` and `SvgImageData::from_data` in
+`src/node/svg.rs`. Upstream parsed every SVG (an `<svg>` element written in
+the document, or an SVG image) with usvg's default options, whose string
+resolver reads whatever path an `<image>` or `<feImage>` names from disk
+(`std::fs::read`), whatever `resources_dir`, past the document's net
+provider. An email could have local files shown (and printed into a PDF),
+`/dev/zero` read without end, and on Windows a UNC path
+(`\\host\share\x.png`) opened over SMB, handing that host the reader's
+NTLM hash, all with remote content blocked. Now `<image>` loads only
+pictures inside the SVG (`data:` URLs), not gzip-compressed ones, and
+`from_data` refuses gzip (SVGZ), which usvg inflated without limit: the
+embedder inflates it, within its limits, before handing it over.
+
+Keep: Picacho relies on it for mail.
+
 ## Upgrading
 
 ```sh

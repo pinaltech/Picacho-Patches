@@ -28,6 +28,22 @@ const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
 /// The default color for text selection highlights
 const SELECTION_COLOR: Color = Color::from_rgb8(180, 213, 255);
 
+/// The fill rule of the layer every SVG image is drawn in (see
+/// [`is_image_layer`]). Nothing else pushes an even-odd layer.
+const IMAGE_LAYER_FILL: peniko::Fill = peniko::Fill::EvenOdd;
+
+/// Whether a recorded layer holds an image's own drawing: an SVG image's
+/// shapes, which unlike a raster image are recorded as ordinary fills and
+/// strokes. A consumer that recolors the document's drawing (for dark
+/// reading, say) can leave what is inside such a layer alone, as it leaves
+/// raster images.
+pub fn is_image_layer(layer: &anyrender::recording::LayerCommand) -> bool {
+    layer.fill == IMAGE_LAYER_FILL
+        && layer.alpha == 1.0
+        && layer.filter.is_none()
+        && layer.backdrop_filter.is_none()
+}
+
 /// Pre-computed `Scene`s for each CustomWidget, keyed by `(document id, node id)`
 type CustomWidgetSceneMap = HashMap<(usize, NodeId), Scene>;
 

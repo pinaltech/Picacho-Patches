@@ -1,0 +1,244 @@
+BackdropBlur primitive and Window::paint_backdrop_blur
+
+diff --git a/src/scene.rs b/src/scene.rs
+index a4116aa..41d14ab 100644
+--- a/src/scene.rs
++++ b/src/scene.rs
+@@ -50,6 +50,11 @@ pub struct Scene {
+     pub subpixel_sprites: Vec<SubpixelSprite>,
+     pub polychrome_sprites: Vec<PolychromeSprite>,
+     pub surfaces: Vec<PaintSurface>,
++    /// Regions whose already-drawn content is blurred before what is drawn
++    /// after them (see [`BackdropBlur`]). Batches never span one, so a
++    /// renderer that supports them applies each between the batches before
++    /// and after its order ([`Scene::batch_order`]); others ignore them.
++    pub backdrop_blurs: Vec<BackdropBlur>,
+ }
+ 
+ #[expect(missing_docs)]
+@@ -66,6 +71,7 @@ impl Scene {
+         self.subpixel_sprites.clear();
+         self.polychrome_sprites.clear();
+         self.surfaces.clear();
++        self.backdrop_blurs.clear();
+     }
+ 
+     pub fn len(&self) -> usize {
+@@ -133,6 +139,10 @@ impl Scene {
+                 surface.order = order;
+                 self.surfaces.push(surface.clone());
+             }
++            Primitive::BackdropBlur(blur) => {
++                blur.order = order;
++                self.backdrop_blurs.push(*blur);
++            }
+         }
+         self.paint_operations
+             .push(PaintOperation::Primitive(primitive));
+@@ -160,6 +170,28 @@ impl Scene {
+         self.polychrome_sprites
+             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
+         self.surfaces.sort_by_key(|surface| surface.order);
++        self.backdrop_blurs.sort_by_key(|blur| blur.order);
++    }
++
++    /// The draw order of `batch`'s first primitive, for placing backdrop
++    /// blurs between batches.
++    pub fn batch_order(&self, batch: &PrimitiveBatch) -> DrawOrder {
++        match batch {
++            PrimitiveBatch::Shadows(range) => self.shadows[range.start].order,
++            PrimitiveBatch::Quads(range) => self.quads[range.start].order,
++            PrimitiveBatch::Paths(range) => self.paths[range.start].order,
++            PrimitiveBatch::Underlines(range) => self.underlines[range.start].order,
++            PrimitiveBatch::MonochromeSprites { range, .. } => {
++                self.monochrome_sprites[range.start].order
++            }
++            PrimitiveBatch::SubpixelSprites { range, .. } => {
++                self.subpixel_sprites[range.start].order
++            }
++            PrimitiveBatch::PolychromeSprites { range, .. } => {
++                self.polychrome_sprites[range.start].order
++            }
++            PrimitiveBatch::Surfaces(range) => self.surfaces[range.start].order,
++        }
+     }
+ 
+     #[cfg_attr(
+@@ -187,6 +219,7 @@ impl Scene {
+             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
+             surfaces_start: 0,
+             surfaces_iter: self.surfaces.iter().peekable(),
++            backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
+         }
+     }
+ }
+@@ -200,6 +233,9 @@ impl Scene {
+     allow(dead_code)
+ )]
+ pub(crate) enum PrimitiveKind {
++    /// First, so that at an equal order a blur comes before what is drawn
++    /// with it.
++    BackdropBlur,
+     Shadow,
+     #[default]
+     Quad,
+@@ -228,6 +264,7 @@ pub enum Primitive {
+     SubpixelSprite(SubpixelSprite),
+     PolychromeSprite(PolychromeSprite),
+     Surface(PaintSurface),
++    BackdropBlur(BackdropBlur),
+ }
+ 
+ #[expect(missing_docs)]
+@@ -242,6 +279,7 @@ impl Primitive {
+             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
+             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
+             Primitive::Surface(surface) => &surface.bounds,
++            Primitive::BackdropBlur(blur) => &blur.bounds,
+         }
+     }
+ 
+@@ -255,6 +293,7 @@ impl Primitive {
+             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
+             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
+             Primitive::Surface(surface) => &surface.content_mask,
++            Primitive::BackdropBlur(blur) => &blur.content_mask,
+         }
+     }
+ }
+@@ -283,13 +322,31 @@ struct BatchIterator<'a> {
+     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
+     surfaces_start: usize,
+     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
++    /// Not batched: only bounds the batches around each blur.
++    backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
+ }
+ 
+ impl<'a> Iterator for BatchIterator<'a> {
+     type Item = PrimitiveBatch;
+ 
+     fn next(&mut self) -> Option<Self::Item> {
++        loop {
++            if let Some(batch) = self.next_batch() {
++                return batch;
++            }
++        }
++    }
++}
++
++impl<'a> BatchIterator<'a> {
++    /// The next batch (`Some(Some)`), the end (`Some(None)`), or `None`
++    /// after passing over a backdrop blur, which yields no batch.
++    fn next_batch(&mut self) -> Option<Option<PrimitiveBatch>> {
+         let mut orders_and_kinds = [
++            (
++                self.backdrop_blurs_iter.peek().map(|b| b.order),
++                PrimitiveKind::BackdropBlur,
++            ),
+             (
+                 self.shadows_iter.peek().map(|s| s.order),
+                 PrimitiveKind::Shadow,
+@@ -324,10 +381,14 @@ impl<'a> Iterator for BatchIterator<'a> {
+         let (batch_kind, max_order_and_kind) = if first.0.is_some() {
+             (first.1, (second.0.unwrap_or(u32::MAX), second.1))
+         } else {
+-            return None;
++            return Some(None);
+         };
+ 
+-        match batch_kind {
++        Some(match batch_kind {
++            PrimitiveKind::BackdropBlur => {
++                self.backdrop_blurs_iter.next();
++                return None;
++            }
+             PrimitiveKind::Shadow => {
+                 let shadows_start = self.shadows_start;
+                 let mut shadows_end = shadows_start + 1;
+@@ -461,7 +522,7 @@ impl<'a> Iterator for BatchIterator<'a> {
+                 self.surfaces_start = surfaces_end;
+                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
+             }
+-        }
++        })
+     }
+ }
+ 
+@@ -591,6 +652,29 @@ impl From<Shadow> for Primitive {
+     }
+ }
+ 
++/// Blurs what has been drawn so far within `bounds` (rounded by
++/// `corner_radii` and clipped to `content_mask`), as CSS's
++/// `backdrop-filter: blur()` does: what is drawn after it is drawn over the
++/// blur. `blur_radius` is the Gaussian's standard deviation.
++///
++/// Renderers without support draw nothing for it.
++#[derive(Debug, Copy, Clone)]
++#[repr(C)]
++#[expect(missing_docs)]
++pub struct BackdropBlur {
++    pub order: DrawOrder,
++    pub blur_radius: ScaledPixels,
++    pub bounds: Bounds<ScaledPixels>,
++    pub corner_radii: Corners<ScaledPixels>,
++    pub content_mask: ContentMask<ScaledPixels>,
++}
++
++impl From<BackdropBlur> for Primitive {
++    fn from(blur: BackdropBlur) -> Self {
++        Primitive::BackdropBlur(blur)
++    }
++}
++
+ /// The style of a border.
+ #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+ #[repr(C)]
+diff --git a/src/window.rs b/src/window.rs
+index 4e2e1a7..b774614 100644
+--- a/src/window.rs
++++ b/src/window.rs
+@@ -8,7 +8,7 @@ use crate::subscription::SingleSubscriberSet;
+ use crate::taffy::TaffyLayoutEngine;
+ use crate::{
+     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
+-    AsyncWindowContext, AtlasTile, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
++    AsyncWindowContext, AtlasTile, BackdropBlur, AvailableSpace, Background, BorderStyle, Bounds, BoxShadow,
+     Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
+     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
+     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
+@@ -4838,6 +4838,34 @@ impl Window {
+         }
+     }
+ 
++    /// Blurs what has been painted so far within `bounds`, rounded by
++    /// `corner_radii` and clipped to the current content mask: CSS's
++    /// `backdrop-filter: blur()`. What is painted after it is painted over
++    /// the blur. `blur_radius` is the Gaussian's standard deviation; zero
++    /// paints nothing. Renderers without support (only the wgpu renderer
++    /// has it) leave the content as it was.
++    ///
++    /// This method should only be called as part of the paint phase of element drawing.
++    pub fn paint_backdrop_blur(
++        &mut self,
++        bounds: Bounds<Pixels>,
++        corner_radii: Corners<Pixels>,
++        blur_radius: Pixels,
++    ) {
++        self.invalidator.debug_assert_paint();
++        if blur_radius <= Pixels::ZERO {
++            return;
++        }
++        let scale_factor = self.scale_factor();
++        self.next_frame.scene.insert_primitive(BackdropBlur {
++            order: 0,
++            blur_radius: blur_radius.scale(scale_factor),
++            bounds: self.cover_bounds(bounds),
++            corner_radii: corner_radii.scale(scale_factor),
++            content_mask: self.snapped_content_mask(),
++        });
++    }
++
+     /// Paint the inset shadows from `shadows` into the scene at the current z-index. Should
+     /// be called after the element's background so the shadow layers on top of the fill.
+     /// Drop shadows are skipped; paint those with [`Self::paint_drop_shadows`] before the background.

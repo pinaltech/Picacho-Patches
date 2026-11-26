@@ -1,0 +1,65 @@
+STATUS=SIZE (RFC 8438) parses as StatusAttribute::Size; untagged GENURLAUTH and URLFETCH (RFC 4467) are kept as Response::Other text.
+
+diff --git a/src/parser/rfc3501.rs b/src/parser/rfc3501.rs
+index fa5e55b..a7b8ebe 100644
+--- a/src/parser/rfc3501.rs
++++ b/src/parser/rfc3501.rs
+@@ -273,6 +273,12 @@ named!(status_att<StatusAttribute>, alt!(
+         tag_no_case!("UNSEEN ") >>
+         val: number >>
+         (StatusAttribute::Unseen(val))
++    ) |
++    // STATUS=SIZE (RFC 8438, Picacho patch): the mailbox's size in octets.
++    do_parse!(
++        tag_no_case!("SIZE ") >>
++        val: number_64 >>
++        (StatusAttribute::Size(val))
+     )
+ ));
+ 
+@@ -558,6 +564,9 @@ named!(resp_other<Response>, map_res!(
+             tag_no_case!("LISTRIGHTS") |
+             tag_no_case!("ACL") |
+             tag_no_case!("ID") |
++            // Picacho patch 0007: URLAUTH's GENURLAUTH and URLFETCH (RFC 4467).
++            tag_no_case!("GENURLAUTH") |
++            tag_no_case!("URLFETCH") |
+             tag_no_case!("ENABLED")
+         ),
+         text
+@@ -648,6 +657,23 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn test_status_size_and_urlauth() {
++        match parse_response(b"* STATUS \"Sent Items\" (MESSAGES 3 SIZE 6442450944)\r\n") {
++            Ok((_, Response::MailboxData(MailboxDatum::Status { status, .. }))) => {
++                assert_eq!(status, [
++                    StatusAttribute::Messages(3),
++                    StatusAttribute::Size(6_442_450_944),
++                ]);
++            },
++            rsp => panic!("unexpected response {:?}", rsp),
++        }
++        match parse_response(b"* GENURLAUTH \"imap://a@h/S;UIDVALIDITY=1/;UID=2;urlauth=submit+a:internal:00\"\r\n") {
++            Ok((_, Response::Other(line))) => assert!(line.starts_with("GENURLAUTH \"imap://")),
++            rsp => panic!("unexpected response {:?}", rsp),
++        }
++    }
++
+     #[test]
+     fn test_status() {
+         match parse_response(b"* STATUS blurdybloop (MESSAGES 231 UIDNEXT 44292)\r\n") {
+diff --git a/src/types.rs b/src/types.rs
+index e430aa3..22f3c66 100644
+--- a/src/types.rs
++++ b/src/types.rs
+@@ -69,6 +69,7 @@ pub enum StatusAttribute {
+     UidNext(u32),
+     UidValidity(u32),
+     Unseen(u32),
++    Size(u64), // RFC 8438 (Picacho patch)
+ }
+ 
+ #[derive(Debug, Eq, PartialEq)]

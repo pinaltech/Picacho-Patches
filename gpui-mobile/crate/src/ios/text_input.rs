@@ -19,6 +19,7 @@ use gpui::{KeyDownEvent, Keystroke, Modifiers, PlatformInput};
 pub(super) unsafe fn configure_keyboard_traits(
     view: *mut objc2::runtime::AnyObject,
     keyboard_type: isize,
+    secure: bool,
 ) {
     let send: unsafe extern "C-unwind" fn(
         *mut objc2::runtime::AnyObject,
@@ -29,6 +30,27 @@ pub(super) unsafe fn configure_keyboard_traits(
         send(view, objc2::sel!(setKeyboardType:), keyboard_type);
         send(view, objc2::sel!(setAutocorrectionType:), 1);
         send(view, objc2::sel!(setAutocapitalizationType:), 0);
+        // A password: secure entry keeps it out of the keyboard's learning,
+        // QuickType suggestions and screen recordings; no spelling check, and
+        // AutoFill may offer saved passwords (UITextContentTypePassword).
+        let flag: unsafe extern "C-unwind" fn(
+            *mut objc2::runtime::AnyObject,
+            objc2::runtime::Sel,
+            objc2::runtime::Bool,
+        ) = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+        flag(view, objc2::sel!(setSecureTextEntry:), objc2::runtime::Bool::new(secure));
+        send(view, objc2::sel!(setSpellCheckingType:), if secure { 1 } else { 0 });
+        let content: *mut objc2::runtime::AnyObject = if secure {
+            objc2::msg_send![objc2::class!(NSString), stringWithUTF8String: c"password".as_ptr()]
+        } else {
+            std::ptr::null_mut()
+        };
+        let object: unsafe extern "C-unwind" fn(
+            *mut objc2::runtime::AnyObject,
+            objc2::runtime::Sel,
+            *mut objc2::runtime::AnyObject,
+        ) = unsafe { std::mem::transmute(objc2::ffi::objc_msgSend as unsafe extern "C-unwind" fn()) };
+        object(view, objc2::sel!(setTextContentType:), content);
     }
 }
 

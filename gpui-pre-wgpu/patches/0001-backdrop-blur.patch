@@ -1,0 +1,991 @@
+Backdrop blur in the wgpu renderer
+
+diff --git b/src/backdrop_blur.rs b/src/backdrop_blur.rs
+new file mode 100644
+index 0000000..8fbebe4
+--- /dev/null
++++ b/src/backdrop_blur.rs
+@@ -0,0 +1,561 @@
++//! Backdrop blur: gpui's `BackdropBlur` primitives, CSS's
++//! `backdrop-filter: blur()`.
++//!
++//! The main pass is interrupted at each blur's draw order (the scene's
++//! batches never span one). Then:
++//!
++//! 1. The region, widened by the blur's reach, is copied out of the frame
++//!    into `source` (the frame's texture must allow `COPY_SRC`).
++//! 2. It is scaled down by `factor` (a power of two keeping the blur within
++//!    a few dozen taps) into `a`, averaging the pixels each covers.
++//! 3. A separable Gaussian blurs `a` into `b` horizontally and `b` back into
++//!    `a` vertically.
++//! 4. `a` is drawn back into the frame, scaled up, clipped to the region's
++//!    rounded rectangle, and the main pass resumes over it.
++use bytemuck::{Pod, Zeroable};
++use gpui::{BackdropBlur, Bounds, DevicePixels, ScaledPixels, Size};
++use wgpu::util::DeviceExt as _;
++
++const SHADER: &str = include_str!("backdrop_blur.wgsl");
++
++/// The most taps either side a blur pass takes, in the scaled-down texture.
++const MAX_SIGMA_SCALED: f32 = 8.0;
++/// The largest scale-down.
++const MAX_FACTOR: u32 = 16;
++
++#[repr(C)]
++#[derive(Clone, Copy, Pod, Zeroable, Default)]
++struct BlurParams {
++    source_size: [f32; 2],
++    valid_min: [f32; 2],
++    valid_max: [f32; 2],
++    direction: [f32; 2],
++    sigma: f32,
++    factor: f32,
++    bounds_origin: [f32; 2],
++    bounds_size: [f32; 2],
++    _pad: [f32; 2],
++    corner_radii: [f32; 4],
++}
++
++/// A texture and its view.
++struct Target {
++    texture: wgpu::Texture,
++    view: wgpu::TextureView,
++}
++
++/// The textures for one frame size: the frame copy, and the scaled-down
++/// pair for each factor used.
++struct Textures {
++    width: u32,
++    height: u32,
++    source: Target,
++    scaled: Vec<(u32, Target, Target)>,
++}
++
++/// Pipelines and textures, made when a frame first has a blur.
++pub(crate) struct BackdropBlurRenderer {
++    layout: wgpu::BindGroupLayout,
++    sampler: wgpu::Sampler,
++    downsample: wgpu::RenderPipeline,
++    blur: wgpu::RenderPipeline,
++    composite: wgpu::RenderPipeline,
++    format: wgpu::TextureFormat,
++    textures: Option<Textures>,
++}
++
++/// A rectangle in whole pixels: x, y, width, height.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct Rect {
++    x: u32,
++    y: u32,
++    width: u32,
++    height: u32,
++}
++
++impl Rect {
++    fn is_empty(&self) -> bool {
++        self.width == 0 || self.height == 0
++    }
++}
++
++/// What one blur draws, worked out from the primitive and the frame size.
++#[derive(Clone, Copy, Debug, PartialEq)]
++struct Plan {
++    /// Copied from the frame (the region widened by the blur's reach),
++    /// aligned to `factor`.
++    copy: Rect,
++    /// Drawn into: the region clipped to its content mask and the frame.
++    draw: Rect,
++    factor: u32,
++    /// The blur's standard deviation in the scaled-down texture's pixels.
++    sigma: f32,
++}
++
++fn plan(blur: &BackdropBlur, frame: Size<DevicePixels>) -> Option<Plan> {
++    let width = frame.width.0.max(0) as f32;
++    let height = frame.height.0.max(0) as f32;
++    let sigma = blur.blur_radius.0;
++    if !(sigma > 0.0) || width < 1.0 || height < 1.0 {
++        return None;
++    }
++    let frame_bounds = Bounds {
++        origin: gpui::point(ScaledPixels(0.0), ScaledPixels(0.0)),
++        size: gpui::size(ScaledPixels(width), ScaledPixels(height)),
++    };
++    let visible = blur
++        .bounds
++        .intersect(&blur.content_mask.bounds)
++        .intersect(&frame_bounds);
++    let draw = outer_rect(visible, width as u32, height as u32, 1)?;
++    let mut factor = 1;
++    while factor < MAX_FACTOR && sigma / factor as f32 > MAX_SIGMA_SCALED {
++        factor *= 2;
++    }
++    // What the Gaussian reaches beyond the region, plus a scaled-down pixel.
++    let reach = ScaledPixels(sigma * 3.0 + factor as f32);
++    let copy = outer_rect(visible.dilate(reach), width as u32, height as u32, factor)?;
++    Some(Plan {
++        copy,
++        draw,
++        factor,
++        sigma: sigma / factor as f32,
++    })
++}
++
++/// The whole pixels covering `bounds`, within a `width`×`height` frame,
++/// widened to multiples of `align`.
++fn outer_rect(bounds: Bounds<ScaledPixels>, width: u32, height: u32, align: u32) -> Option<Rect> {
++    let floor_to = |v: f32| ((v.max(0.0).floor() as u32) / align) * align;
++    let ceil_to = |v: f32, limit: u32| ((v.max(0.0).ceil() as u32).div_ceil(align) * align).min(limit);
++    let x0 = floor_to(bounds.origin.x.0).min(width);
++    let y0 = floor_to(bounds.origin.y.0).min(height);
++    let x1 = ceil_to(bounds.origin.x.0 + bounds.size.width.0, width);
++    let y1 = ceil_to(bounds.origin.y.0 + bounds.size.height.0, height);
++    let rect = Rect {
++        x: x0,
++        y: y0,
++        width: x1.saturating_sub(x0),
++        height: y1.saturating_sub(y0),
++    };
++    (!rect.is_empty()).then_some(rect)
++}
++
++impl BackdropBlurRenderer {
++    pub(crate) fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
++        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
++            label: Some("backdrop_blur_shaders"),
++            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
++        });
++        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++            label: Some("backdrop_blur_layout"),
++            entries: &[
++                wgpu::BindGroupLayoutEntry {
++                    binding: 0,
++                    visibility: wgpu::ShaderStages::FRAGMENT,
++                    ty: wgpu::BindingType::Texture {
++                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
++                        view_dimension: wgpu::TextureViewDimension::D2,
++                        multisampled: false,
++                    },
++                    count: None,
++                },
++                wgpu::BindGroupLayoutEntry {
++                    binding: 1,
++                    visibility: wgpu::ShaderStages::FRAGMENT,
++                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                    count: None,
++                },
++                wgpu::BindGroupLayoutEntry {
++                    binding: 2,
++                    visibility: wgpu::ShaderStages::FRAGMENT,
++                    ty: wgpu::BindingType::Buffer {
++                        ty: wgpu::BufferBindingType::Uniform,
++                        has_dynamic_offset: false,
++                        min_binding_size: wgpu::BufferSize::new(
++                            std::mem::size_of::<BlurParams>() as u64,
++                        ),
++                    },
++                    count: None,
++                },
++            ],
++        });
++        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++            label: Some("backdrop_blur_pipeline_layout"),
++            bind_group_layouts: &[Some(&layout)],
++            immediate_size: 0,
++        });
++        let pipeline = |name: &str, entry: &str, blend: Option<wgpu::BlendState>| {
++            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                label: Some(name),
++                layout: Some(&pipeline_layout),
++                vertex: wgpu::VertexState {
++                    module: &module,
++                    entry_point: Some("vs_fullscreen"),
++                    buffers: &[],
++                    compilation_options: wgpu::PipelineCompilationOptions::default(),
++                },
++                fragment: Some(wgpu::FragmentState {
++                    module: &module,
++                    entry_point: Some(entry),
++                    targets: &[Some(wgpu::ColorTargetState {
++                        format,
++                        blend,
++                        write_mask: wgpu::ColorWrites::ALL,
++                    })],
++                    compilation_options: wgpu::PipelineCompilationOptions::default(),
++                }),
++                primitive: wgpu::PrimitiveState {
++                    topology: wgpu::PrimitiveTopology::TriangleList,
++                    ..Default::default()
++                },
++                depth_stencil: None,
++                multisample: wgpu::MultisampleState::default(),
++                multiview_mask: None,
++                cache: None,
++            })
++        };
++        let downsample = pipeline("backdrop_blur_downsample", "fs_downsample", None);
++        let blur = pipeline("backdrop_blur_blur", "fs_blur", None);
++        let composite = pipeline(
++            "backdrop_blur_composite",
++            "fs_composite",
++            Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
++        );
++        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
++            label: Some("backdrop_blur_sampler"),
++            address_mode_u: wgpu::AddressMode::ClampToEdge,
++            address_mode_v: wgpu::AddressMode::ClampToEdge,
++            mag_filter: wgpu::FilterMode::Linear,
++            min_filter: wgpu::FilterMode::Linear,
++            ..Default::default()
++        });
++        Self {
++            layout,
++            sampler,
++            downsample,
++            blur,
++            composite,
++            format,
++            textures: None,
++        }
++    }
++
++    /// Frees the textures (the frame size changed, or the device is being
++    /// recovered).
++    pub(crate) fn release_textures(&mut self) {
++        self.textures = None;
++    }
++
++    fn target(
++        device: &wgpu::Device,
++        format: wgpu::TextureFormat,
++        width: u32,
++        height: u32,
++        usage: wgpu::TextureUsages,
++    ) -> Target {
++        let texture = device.create_texture(&wgpu::TextureDescriptor {
++            label: Some("backdrop_blur_texture"),
++            size: wgpu::Extent3d {
++                width: width.max(1),
++                height: height.max(1),
++                depth_or_array_layers: 1,
++            },
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: wgpu::TextureDimension::D2,
++            format,
++            usage,
++            view_formats: &[],
++        });
++        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
++        Target { texture, view }
++    }
++
++    /// The textures for a `width`×`height` frame and `factor`, made as needed.
++    fn textures(
++        &mut self,
++        device: &wgpu::Device,
++        width: u32,
++        height: u32,
++        factor: u32,
++    ) -> (&Target, &Target, &Target) {
++        let format = self.format;
++        if self
++            .textures
++            .as_ref()
++            .is_none_or(|t| t.width != width || t.height != height)
++        {
++            self.textures = Some(Textures {
++                width,
++                height,
++                source: Self::target(
++                    device,
++                    format,
++                    width,
++                    height,
++                    wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::TEXTURE_BINDING,
++                ),
++                scaled: Vec::new(),
++            });
++        }
++        let textures = self.textures.as_mut().expect("made above");
++        if !textures.scaled.iter().any(|(f, _, _)| *f == factor) {
++            let usage =
++                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
++            let (w, h) = (width.div_ceil(factor), height.div_ceil(factor));
++            textures.scaled.push((
++                factor,
++                Self::target(device, format, w, h, usage),
++                Self::target(device, format, w, h, usage),
++            ));
++        }
++        let textures = self.textures.as_ref().expect("made above");
++        let (_, a, b) = textures
++            .scaled
++            .iter()
++            .find(|(f, _, _)| *f == factor)
++            .expect("made above");
++        (&textures.source, a, b)
++    }
++
++    /// Records `blur` into `encoder`, between render passes on `frame`
++    /// (whose texture is `frame_texture`, `size` pixels).
++    pub(crate) fn record(
++        &mut self,
++        device: &wgpu::Device,
++        encoder: &mut wgpu::CommandEncoder,
++        frame_texture: &wgpu::Texture,
++        frame_view: &wgpu::TextureView,
++        size: Size<DevicePixels>,
++        blur: &BackdropBlur,
++    ) {
++        let Some(plan) = plan(blur, size) else {
++            return;
++        };
++        if frame_texture.format() != self.format {
++            return;
++        }
++        let (width, height) = (size.width.0 as u32, size.height.0 as u32);
++        let factor = plan.factor;
++        let layout = self.layout.clone();
++        let sampler = self.sampler.clone();
++        let downsample = self.downsample.clone();
++        let blur_pipeline = self.blur.clone();
++        let composite = self.composite.clone();
++        let (source, a, b) = self.textures(device, width, height, factor);
++
++        encoder.copy_texture_to_texture(
++            wgpu::TexelCopyTextureInfo {
++                texture: frame_texture,
++                mip_level: 0,
++                origin: wgpu::Origin3d {
++                    x: plan.copy.x,
++                    y: plan.copy.y,
++                    z: 0,
++                },
++                aspect: wgpu::TextureAspect::All,
++            },
++            wgpu::TexelCopyTextureInfo {
++                texture: &source.texture,
++                mip_level: 0,
++                origin: wgpu::Origin3d {
++                    x: plan.copy.x,
++                    y: plan.copy.y,
++                    z: 0,
++                },
++                aspect: wgpu::TextureAspect::All,
++            },
++            wgpu::Extent3d {
++                width: plan.copy.width,
++                height: plan.copy.height,
++                depth_or_array_layers: 1,
++            },
++        );
++
++        let scaled = Rect {
++            x: plan.copy.x / factor,
++            y: plan.copy.y / factor,
++            width: plan.copy.width.div_ceil(factor),
++            height: plan.copy.height.div_ceil(factor),
++        };
++        let scaled_size = [
++            width.div_ceil(factor) as f32,
++            height.div_ceil(factor) as f32,
++        ];
++        let scaled_min = [scaled.x as f32, scaled.y as f32];
++        let scaled_max = [
++            (scaled.x + scaled.width) as f32,
++            (scaled.y + scaled.height) as f32,
++        ];
++        let corners = &blur.corner_radii;
++        let base = BlurParams {
++            factor: factor as f32,
++            sigma: plan.sigma,
++            bounds_origin: [blur.bounds.origin.x.0, blur.bounds.origin.y.0],
++            bounds_size: [blur.bounds.size.width.0, blur.bounds.size.height.0],
++            corner_radii: [
++                corners.top_left.0,
++                corners.top_right.0,
++                corners.bottom_right.0,
++                corners.bottom_left.0,
++            ],
++            ..Default::default()
++        };
++        let passes = [
++            (
++                &downsample,
++                &source.view,
++                &a.view,
++                scaled,
++                BlurParams {
++                    source_size: [width as f32, height as f32],
++                    valid_min: [plan.copy.x as f32, plan.copy.y as f32],
++                    valid_max: [
++                        (plan.copy.x + plan.copy.width) as f32,
++                        (plan.copy.y + plan.copy.height) as f32,
++                    ],
++                    ..base
++                },
++            ),
++            (
++                &blur_pipeline,
++                &a.view,
++                &b.view,
++                scaled,
++                BlurParams {
++                    source_size: scaled_size,
++                    valid_min: scaled_min,
++                    valid_max: scaled_max,
++                    direction: [1.0, 0.0],
++                    ..base
++                },
++            ),
++            (
++                &blur_pipeline,
++                &b.view,
++                &a.view,
++                scaled,
++                BlurParams {
++                    source_size: scaled_size,
++                    valid_min: scaled_min,
++                    valid_max: scaled_max,
++                    direction: [0.0, 1.0],
++                    ..base
++                },
++            ),
++            (
++                &composite,
++                &a.view,
++                frame_view,
++                plan.draw,
++                BlurParams {
++                    source_size: scaled_size,
++                    valid_min: scaled_min,
++                    valid_max: scaled_max,
++                    ..base
++                },
++            ),
++        ];
++        for (index, (pipeline, input, output, scissor, params)) in passes.into_iter().enumerate() {
++            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
++                label: Some("backdrop_blur_params"),
++                contents: bytemuck::bytes_of(&params),
++                usage: wgpu::BufferUsages::UNIFORM,
++            });
++            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
++                label: Some("backdrop_blur_bind_group"),
++                layout: &layout,
++                entries: &[
++                    wgpu::BindGroupEntry {
++                        binding: 0,
++                        resource: wgpu::BindingResource::TextureView(input),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 1,
++                        resource: wgpu::BindingResource::Sampler(&sampler),
++                    },
++                    wgpu::BindGroupEntry {
++                        binding: 2,
++                        resource: buffer.as_entire_binding(),
++                    },
++                ],
++            });
++            // The composite draws over the frame; the others replace what
++            // their texture held.
++            let load = if index == 3 {
++                wgpu::LoadOp::Load
++            } else {
++                wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)
++            };
++            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++                label: Some("backdrop_blur_pass"),
++                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                    view: output,
++                    resolve_target: None,
++                    ops: wgpu::Operations {
++                        load,
++                        store: wgpu::StoreOp::Store,
++                    },
++                    depth_slice: None,
++                })],
++                depth_stencil_attachment: None,
++                ..Default::default()
++            });
++            pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
++            pass.set_pipeline(pipeline);
++            pass.set_bind_group(0, &bind_group, &[]);
++            pass.draw(0..3, 0..1);
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use gpui::{ContentMask, Corners, DevicePixels, point, size};
++
++    fn blur(x: f32, y: f32, w: f32, h: f32, sigma: f32) -> BackdropBlur {
++        let bounds = Bounds {
++            origin: point(ScaledPixels(x), ScaledPixels(y)),
++            size: size(ScaledPixels(w), ScaledPixels(h)),
++        };
++        BackdropBlur {
++            order: 0,
++            blur_radius: ScaledPixels(sigma),
++            bounds,
++            corner_radii: Corners::default(),
++            content_mask: ContentMask { bounds },
++        }
++    }
++
++    fn frame(w: i32, h: i32) -> Size<DevicePixels> {
++        size(DevicePixels(w), DevicePixels(h))
++    }
++
++    #[test]
++    fn plans_scale_down_large_blurs_and_stay_in_the_frame() {
++        let p = plan(&blur(10.0, 10.0, 100.0, 50.0, 4.0), frame(200, 100)).unwrap();
++        assert_eq!(p.factor, 1);
++        assert_eq!(p.sigma, 4.0);
++        assert_eq!(p.draw, Rect { x: 10, y: 10, width: 100, height: 50 });
++        // Widened by 3σ + 1, clipped to the frame.
++        assert_eq!(p.copy, Rect { x: 0, y: 0, width: 123, height: 73 });
++
++        let p = plan(&blur(0.0, 0.0, 1000.0, 800.0, 40.0), frame(1000, 800)).unwrap();
++        assert_eq!(p.factor, 8);
++        assert_eq!(p.sigma, 5.0);
++        assert_eq!(p.copy, Rect { x: 0, y: 0, width: 1000, height: 800 });
++        assert_eq!(p.copy.x % 8, 0);
++
++        let p = plan(&blur(0.0, 0.0, 100.0, 100.0, 100_000.0), frame(100, 100)).unwrap();
++        assert_eq!(p.factor, MAX_FACTOR);
++    }
++
++    #[test]
++    fn nothing_is_planned_for_no_blur_or_nothing_visible() {
++        assert!(plan(&blur(0.0, 0.0, 10.0, 10.0, 0.0), frame(100, 100)).is_none());
++        assert!(plan(&blur(200.0, 0.0, 10.0, 10.0, 2.0), frame(100, 100)).is_none());
++        assert!(plan(&blur(0.0, 0.0, 10.0, 10.0, 2.0), frame(0, 0)).is_none());
++    }
++}
+diff --git b/src/backdrop_blur.wgsl b/src/backdrop_blur.wgsl
+new file mode 100644
+index 0000000..e23311a
+--- /dev/null
++++ b/src/backdrop_blur.wgsl
+@@ -0,0 +1,107 @@
++// Backdrop blur (`BackdropBlur` in gpui's scene): what was drawn within a
++// region is copied out of the frame, scaled down, blurred with a separable
++// Gaussian, and drawn back scaled up, clipped to the region's rounded
++// rectangle. See `backdrop_blur.rs` for the passes.
++
++struct BlurParams {
++    // The sampled texture's size, in its pixels.
++    source_size: vec2<f32>,
++    // The part of the sampled texture holding valid content, in its pixels.
++    // Samples are clamped to it.
++    valid_min: vec2<f32>,
++    valid_max: vec2<f32>,
++    // Blur passes: one texel along x or y.
++    direction: vec2<f32>,
++    // Blur passes: the Gaussian's standard deviation, in source pixels.
++    sigma: f32,
++    // How many frame pixels one pixel of the scaled-down textures covers.
++    factor: f32,
++    // Composite: the rounded rectangle drawn into, in frame pixels.
++    bounds_origin: vec2<f32>,
++    bounds_size: vec2<f32>,
++    // Composite: top left, top right, bottom right, bottom left.
++    corner_radii: vec4<f32>,
++}
++
++@group(0) @binding(0) var t_source: texture_2d<f32>;
++@group(0) @binding(1) var s_source: sampler;
++@group(0) @binding(2) var<uniform> params: BlurParams;
++
++// One triangle covering the whole target; the scissor rectangle limits it.
++@vertex
++fn vs_fullscreen(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
++    let uv = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
++    return vec4<f32>(uv * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
++}
++
++fn sample_clamped(coord: vec2<f32>) -> vec4<f32> {
++    let lo = params.valid_min + vec2<f32>(0.5);
++    let hi = max(params.valid_max - vec2<f32>(0.5), lo);
++    let c = clamp(coord, lo, hi);
++    return textureSampleLevel(t_source, s_source, c / params.source_size, 0.0);
++}
++
++// Frame copy → scaled-down texture: each output pixel averages the
++// `factor`×`factor` frame pixels it covers, two by two with bilinear samples.
++@fragment
++fn fs_downsample(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
++    let factor = params.factor;
++    let origin = floor(position.xy) * factor;
++    if (factor < 2.0) {
++        return sample_clamped(origin + vec2<f32>(0.5));
++    }
++    let steps = i32(factor / 2.0);
++    var sum = vec4<f32>(0.0);
++    for (var y = 0; y < steps; y++) {
++        for (var x = 0; x < steps; x++) {
++            let at = origin + vec2<f32>(f32(x) * 2.0 + 1.0, f32(y) * 2.0 + 1.0);
++            sum += sample_clamped(at);
++        }
++    }
++    return sum / f32(steps * steps);
++}
++
++// One direction of the separable Gaussian.
++@fragment
++fn fs_blur(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
++    let sigma = max(params.sigma, 0.0001);
++    let reach = min(i32(ceil(sigma * 3.0)), 48);
++    let center = position.xy;
++    var sum = vec4<f32>(0.0);
++    var weights = 0.0;
++    for (var i = -reach; i <= reach; i++) {
++        let offset = f32(i);
++        let weight = exp(-(offset * offset) / (2.0 * sigma * sigma));
++        sum += sample_clamped(center + params.direction * offset) * weight;
++        weights += weight;
++    }
++    return sum / weights;
++}
++
++// The distance from `point` to the rounded rectangle's edge, negative inside.
++fn rounded_rect_distance(point: vec2<f32>) -> f32 {
++    let half_size = params.bounds_size * 0.5;
++    let center = params.bounds_origin + half_size;
++    let p = point - center;
++    var radius: f32;
++    if (p.x < 0.0) {
++        if (p.y < 0.0) { radius = params.corner_radii.x; } else { radius = params.corner_radii.w; }
++    } else {
++        if (p.y < 0.0) { radius = params.corner_radii.y; } else { radius = params.corner_radii.z; }
++    }
++    radius = min(radius, min(half_size.x, half_size.y));
++    let q = abs(p) - half_size + vec2<f32>(radius);
++    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - radius;
++}
++
++// Blurred texture → frame, scaled up, within the rounded rectangle.
++// Premultiplied: drawn with premultiplied alpha blending.
++@fragment
++fn fs_composite(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
++    let coverage = clamp(0.5 - rounded_rect_distance(position.xy), 0.0, 1.0);
++    if (coverage <= 0.0) {
++        discard;
++    }
++    let color = sample_clamped(position.xy / params.factor);
++    return color * coverage;
++}
+diff --git a/src/gpui_wgpu.rs b/src/gpui_wgpu.rs
+index 29a79af..211ef59 100644
+--- a/src/gpui_wgpu.rs
++++ b/src/gpui_wgpu.rs
+@@ -1,3 +1,4 @@
++mod backdrop_blur;
+ mod cosmic_text_system;
+ mod wgpu_atlas;
+ mod wgpu_context;
+diff --git a/src/wgpu_renderer.rs b/src/wgpu_renderer.rs
+index 49c58fb..55e6a3b 100644
+--- a/src/wgpu_renderer.rs
++++ b/src/wgpu_renderer.rs
+@@ -1,4 +1,5 @@
+ // Modified for gpui-pre (snapshot of zed@d2a4fb6): adapt device queues and sRGB detection to wgpu 30.0.1.
++use crate::backdrop_blur::BackdropBlurRenderer;
+ use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
+ use anyhow::{Context as _, Result};
+ use bytemuck::{Pod, Zeroable};
+@@ -226,6 +227,9 @@ struct WgpuRendererCore {
+     adapter_info: wgpu::AdapterInfo,
+     target_format: wgpu::TextureFormat,
+     max_texture_size: u32,
++    /// Backdrop blurs' pipelines and textures, made when a frame first has
++    /// one (see `backdrop_blur`).
++    backdrop_blur: Option<BackdropBlurRenderer>,
+ }
+ 
+ /// GPU resources of a windowed renderer. A surface is only ever configured against the
+@@ -461,8 +465,14 @@ impl WgpuRenderer {
+             );
+         }
+ 
++        // Backdrop blurs copy what the frame holds so far out of it.
++        let usage = if surface_caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
++            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC
++        } else {
++            wgpu::TextureUsages::RENDER_ATTACHMENT
++        };
+         let surface_config = wgpu::SurfaceConfiguration {
+-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
++            usage,
+             format: surface_format,
+             color_space: wgpu::SurfaceColorSpace::Auto,
+             width: clamped_width.max(1),
+@@ -1180,6 +1190,9 @@ impl WgpuRenderer {
+                 panic!("Too many consecutive GPU errors. Last error: {error}");
+             } else if self.failed_frame_count > 5 {
+                 core.resources.invalidate_intermediate_textures();
++                if let Some(blur) = &mut core.backdrop_blur {
++                    blur.release_textures();
++                }
+                 self.atlas.clear();
+                 self.needs_redraw = true;
+                 self.failed_frame_count = 0;
+@@ -1221,9 +1234,14 @@ impl WgpuRenderer {
+             .create_view(&wgpu::TextureViewDescriptor::default());
+         let premultiplied_alpha =
+             self.surface_config.alpha_mode == wgpu::CompositeAlphaMode::PreMultiplied;
++        let copyable = self
++            .surface_config
++            .usage
++            .contains(wgpu::TextureUsages::COPY_SRC);
+         if let Err(error) = core.render_frame(
+             scene,
+             &frame_view,
++            copyable.then_some(&frame.texture),
+             size,
+             premultiplied_alpha,
+             wgpu::Color::TRANSPARENT,
+@@ -1392,6 +1410,7 @@ impl WgpuRendererCore {
+             adapter_info: context.adapter.get_info(),
+             target_format,
+             max_texture_size,
++            backdrop_blur: None,
+         }
+     }
+ 
+@@ -1443,6 +1462,7 @@ impl WgpuRendererCore {
+         &mut self,
+         scene: &Scene,
+         target_view: &wgpu::TextureView,
++        target_texture: Option<&wgpu::Texture>,
+         size: Size<DevicePixels>,
+         premultiplied_alpha: bool,
+         clear_color: wgpu::Color,
+@@ -1493,7 +1513,7 @@ impl WgpuRendererCore {
+             bytemuck::bytes_of(&gamma_params),
+         );
+ 
+-        self.record_frame(scene, target_view, clear_color)
++        self.record_frame(scene, target_view, target_texture, size, clear_color)
+             .inspect_err(|_| {
+                 // Queue writes are staged before encoding; flush them even if the frame fails.
+                 self.resources.queue.submit(std::iter::empty());
+@@ -1504,6 +1524,8 @@ impl WgpuRendererCore {
+         &mut self,
+         scene: &Scene,
+         frame_view: &wgpu::TextureView,
++        frame_texture: Option<&wgpu::Texture>,
++        size: Size<DevicePixels>,
+         clear_color: wgpu::Color,
+     ) -> Result<wgpu::SubmissionIndex> {
+         let mut instance_offset = 0;
+@@ -1546,7 +1568,21 @@ impl WgpuRendererCore {
+                 ..Default::default()
+             });
+ 
++            // Without a frame to copy from, blurs are left out.
++            let mut blurs = scene
++                .backdrop_blurs
++                .iter()
++                .filter(|_| frame_texture.is_some())
++                .peekable();
+             for batch in scene.batches() {
++                let order = scene.batch_order(&batch);
++                if blurs.peek().is_some_and(|blur| blur.order <= order) {
++                    drop(pass);
++                    while let Some(blur) = blurs.next_if(|blur| blur.order <= order) {
++                        self.record_backdrop_blur(&mut encoder, frame_texture, frame_view, size, blur);
++                    }
++                    pass = Self::continue_main_pass(&mut encoder, frame_view);
++                }
+                 match batch {
+                     PrimitiveBatch::Quads(range) => self.draw_instances(
+                         &instance_bindings.quads,
+@@ -1639,6 +1675,13 @@ impl WgpuRendererCore {
+                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                 }
+             }
++            // Blurs drawn after everything else.
++            if blurs.peek().is_some() {
++                drop(pass);
++                for blur in blurs {
++                    self.record_backdrop_blur(&mut encoder, frame_texture, frame_view, size, blur);
++                }
++            }
+         }
+ 
+         let submission = self
+@@ -1648,6 +1691,46 @@ impl WgpuRendererCore {
+         Ok(submission)
+     }
+ 
++    /// Starts a render pass on the frame that keeps what it holds.
++    fn continue_main_pass<'encoder>(
++        encoder: &'encoder mut wgpu::CommandEncoder,
++        frame_view: &wgpu::TextureView,
++    ) -> wgpu::RenderPass<'encoder> {
++        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
++            label: Some("main_pass_continued"),
++            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
++                view: frame_view,
++                resolve_target: None,
++                ops: wgpu::Operations {
++                    load: wgpu::LoadOp::Load,
++                    store: wgpu::StoreOp::Store,
++                },
++                depth_slice: None,
++            })],
++            depth_stencil_attachment: None,
++            ..Default::default()
++        })
++    }
++
++    /// Records a backdrop blur between render passes (see `backdrop_blur`).
++    fn record_backdrop_blur(
++        &mut self,
++        encoder: &mut wgpu::CommandEncoder,
++        frame_texture: Option<&wgpu::Texture>,
++        frame_view: &wgpu::TextureView,
++        size: Size<DevicePixels>,
++        blur: &gpui::BackdropBlur,
++    ) {
++        let Some(frame_texture) = frame_texture else {
++            return;
++        };
++        let device = Arc::clone(&self.resources.device);
++        let format = self.target_format;
++        self.backdrop_blur
++            .get_or_insert_with(|| BackdropBlurRenderer::new(&device, format))
++            .record(&device, encoder, frame_texture, frame_view, size, blur);
++    }
++
+     fn write_instances(
+         &mut self,
+         scene: &Scene,
+@@ -2430,14 +2513,13 @@ impl WgpuHeadlessRenderer {
+     fn render(&mut self, scene: &Scene, size: Size<DevicePixels>) -> anyhow::Result<()> {
+         self.check_gpu_errors()?;
+         self.ensure_render_target(size)?;
+-        let view = self
++        let target = self
+             .render_target
+             .as_ref()
+-            .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?
+-            .view
+-            .clone();
++            .ok_or_else(|| anyhow::anyhow!("Headless render target was not created"))?;
++        let (view, texture) = (target.view.clone(), target.texture.clone());
+         self.core
+-            .render_frame(scene, &view, size, false, wgpu::Color::BLACK)?;
++            .render_frame(scene, &view, Some(&texture), size, false, wgpu::Color::BLACK)?;
+         Ok(())
+     }
+ 
+@@ -2723,6 +2805,102 @@ mod tests {
+         Ok(())
+     }
+ 
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn backdrop_blur_blurs_what_is_below_and_not_what_is_above() -> anyhow::Result<()> {
++        let mut renderer = WgpuHeadlessRenderer::new()?;
++        let mut scene = Scene::default();
++        scene.insert_primitive(solid_quad(0.0, 0.0, 32.0, 64.0, gpui::red()));
++        scene.insert_primitive(solid_quad(32.0, 0.0, 32.0, 64.0, gpui::blue()));
++        let bounds = Bounds {
++            origin: Point {
++                x: 0.0.into(),
++                y: 0.0.into(),
++            },
++            size: Size {
++                width: 64.0.into(),
++                height: 64.0.into(),
++            },
++        };
++        scene.insert_primitive(gpui::BackdropBlur {
++            order: 0,
++            blur_radius: 4.0.into(),
++            bounds,
++            corner_radii: Corners::default(),
++            content_mask: ContentMask { bounds },
++        });
++        // Drawn after the blur: stays sharp.
++        scene.insert_primitive(solid_quad(28.0, 50.0, 8.0, 8.0, gpui::white()));
++        scene.finish();
++
++        let image = renderer.render_scene_to_image(&scene, device_size(64, 64))?;
++        // Far from the edge, the colors are as they were.
++        assert_pixel(&image, 2, 20, RED);
++        assert_pixel(&image, 61, 20, BLUE);
++        // At the edge they mix: about half of each.
++        let [r, g, b, a] = image.get_pixel(31, 20).0;
++        assert!((90..=170).contains(&r) && (90..=170).contains(&b) && g < 10 && a == 255,
++            "edge pixel {:?}", [r, g, b, a]);
++        // Either side, a gradient rather than a step.
++        let left = image.get_pixel(27, 20).0;
++        let right = image.get_pixel(36, 20).0;
++        assert!(left[2] > 10 && left[0] > right[0], "{left:?} {right:?}");
++        assert!(right[0] > 10 && right[2] > left[2], "{left:?} {right:?}");
++        // The square on top is untouched, right to its edges.
++        assert_pixel(&image, 28, 50, [255, 255, 255, 255]);
++        assert_pixel(&image, 35, 57, [255, 255, 255, 255]);
++        Ok(())
++    }
++
++    #[cfg(target_os = "linux")]
++    #[test]
++    fn backdrop_blur_keeps_to_its_rounded_bounds() -> anyhow::Result<()> {
++        let mut renderer = WgpuHeadlessRenderer::new()?;
++        let mut scene = Scene::default();
++        // Stripes, which a blur turns to an even mix.
++        for i in 0..32 {
++            let color = if i % 2 == 0 { gpui::red() } else { gpui::blue() };
++            scene.insert_primitive(solid_quad(i as f32 * 2.0, 0.0, 2.0, 64.0, color));
++        }
++        let bounds = Bounds {
++            origin: Point {
++                x: 16.0.into(),
++                y: 16.0.into(),
++            },
++            size: Size {
++                width: 32.0.into(),
++                height: 32.0.into(),
++            },
++        };
++        scene.insert_primitive(gpui::BackdropBlur {
++            order: 0,
++            // Large enough to be scaled down (factor 2).
++            blur_radius: 12.0.into(),
++            bounds,
++            corner_radii: Corners {
++                top_left: 8.0.into(),
++                top_right: 8.0.into(),
++                bottom_right: 8.0.into(),
++                bottom_left: 8.0.into(),
++            },
++            content_mask: ContentMask { bounds },
++        });
++        scene.finish();
++
++        let image = renderer.render_scene_to_image(&scene, device_size(64, 64))?;
++        // Inside: an even mix.
++        let [r, g, b, _] = image.get_pixel(32, 32).0;
++        assert!(r.abs_diff(b) < 30 && r > 90 && g < 10, "{:?}", [r, g, b]);
++        // Outside, and in the rounded corner: the stripes as they were.
++        assert_pixel(&image, 4, 4, RED);
++        assert_pixel(&image, 5, 4, RED);
++        assert_pixel(&image, 6, 4, BLUE);
++        assert_pixel(&image, 16, 16, RED);
++        assert_pixel(&image, 17, 16, RED);
++        assert_pixel(&image, 18, 16, BLUE);
++        Ok(())
++    }
++
+     #[cfg(target_os = "linux")]
+     #[test]
+     fn headless_renderer_captures_each_requested_size() -> anyhow::Result<()> {

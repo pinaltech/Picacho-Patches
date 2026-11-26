@@ -1,0 +1,145 @@
+BaseDocument::set_media_preferences: what prefers-reduced-motion and prefers-contrast see.
+
+diff --git a/src/document.rs b/src/document.rs
+index 3adf016..77d9df1 100644
+--- a/src/document.rs
++++ b/src/document.rs
+@@ -245,6 +245,9 @@ pub struct BaseDocument {
+     /// The device pixel ratio `@media` rules see, when it isn't the
+     /// viewport's scale (see [`Self::set_media_device_pixel_ratio`]).
+     pub(crate) media_device_pixel_ratio: Option<f32>,
++    /// What `prefers-reduced-motion` and `prefers-contrast` see (see
++    /// [`Self::set_media_preferences`]).
++    pub(crate) media_preferences: crate::stylo_device::MediaPreferences,
+     /// Strategy for Stylo's style traversal during `resolve`.
+     pub(crate) style_threading: StyleThreading,
+     /// Whether incremental layout is enabled for this document. When disabled,
+@@ -443,7 +446,7 @@ impl BaseDocument {
+ 
+         let viewport = config.viewport.unwrap_or_default();
+         let media_type = config.media_type.unwrap_or_else(MediaType::screen);
+-        let device = make_device(&viewport, media_type.clone(), font_ctx.clone(), None);
++        let device = make_device(&viewport, media_type.clone(), font_ctx.clone(), None, Default::default());
+         let stylist = Stylist::new(device, QuirksMode::NoQuirks);
+         let snapshots = SnapshotMap::new();
+         let nodes = Box::new(NodeTree::new());
+@@ -486,6 +489,7 @@ impl BaseDocument {
+             media_type,
+             pending_device_changes: DeviceChanges::empty(),
+             media_device_pixel_ratio: None,
++            media_preferences: Default::default(),
+             style_threading: config.style_threading,
+             incremental_layout: config.incremental.unwrap_or(true),
+             subdocument_depth: config.subdocument_depth,
+@@ -2019,6 +2023,17 @@ impl BaseDocument {
+         self.queue_device_changes(DeviceChanges::MEDIA_TYPE);
+     }
+ 
++    /// Sets what `prefers-reduced-motion` and `prefers-contrast` media
++    /// queries see (Media Queries 5 §11.3, §11.4), from the embedder's
++    /// or the system's settings. The default is no preference for either.
++    pub fn set_media_preferences(&mut self, preferences: crate::stylo_device::MediaPreferences) {
++        if self.media_preferences == preferences {
++            return;
++        }
++        self.media_preferences = preferences;
++        self.queue_device_changes(DeviceChanges::MEDIA_TYPE);
++    }
++
+     pub fn viewport(&self) -> &Viewport {
+         &self.viewport
+     }
+@@ -2120,6 +2135,7 @@ impl BaseDocument {
+             self.media_type.clone(),
+             self.font_ctx.clone(),
+             self.media_device_pixel_ratio,
++            self.media_preferences,
+         ));
+         self.scroll_viewport_by(0.0, 0.0); // Clamp scroll offset
+ 
+diff --git a/src/lib.rs b/src/lib.rs
+index fcf5489..fb40511 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -76,6 +76,7 @@ pub use resolved_style::{
+     css_property_is_supported, parse_transform_matrix, resolved_style_property_names,
+ };
+ pub use stylo_to_kurbo::resolve_2d_transform;
++pub use stylo_device::{Contrast, MediaPreferences};
+ 
+ pub mod net;
+ pub mod util;
+diff --git a/src/stylo_device.rs b/src/stylo_device.rs
+index 6f95d84..7cc15a0 100644
+--- a/src/stylo_device.rs
++++ b/src/stylo_device.rs
+@@ -14,7 +14,7 @@ use style::device::Device;
+ use style::media_queries::MediaType;
+ use style::properties::ComputedValues;
+ use style::properties::style_structs::Font;
+-use style::queries::values::PrefersColorScheme;
++use style::queries::values::{PrefersColorScheme, PrefersContrast, PrefersReducedMotion};
+ use style::servo::media_features::PointerCapabilities;
+ 
+ use crate::font_metrics::BlitzFontMetricsProvider;
+@@ -59,11 +59,32 @@ impl DeviceChanges {
+     }
+ }
+ 
++/// What the user prefers, as `prefers-reduced-motion` and
++/// `prefers-contrast` media queries see it (Media Queries 5 §11.3, §11.4).
++/// The embedder knows these from its own settings or the system; the
++/// default is "no preference" for both.
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct MediaPreferences {
++    pub reduced_motion: bool,
++    pub contrast: Contrast,
++}
++
++/// The `prefers-contrast` values (Media Queries 5 §11.4).
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub enum Contrast {
++    #[default]
++    NoPreference,
++    More,
++    Less,
++    Custom,
++}
++
+ pub(crate) fn make_device(
+     viewport: &Viewport,
+     media_type: MediaType,
+     font_ctx: Arc<Mutex<FontContext>>,
+     media_device_pixel_ratio: Option<f32>,
++    preferences: MediaPreferences,
+ ) -> Device {
+     let (width, height) = viewport.logical_size();
+     let viewport_size = euclid::Size2D::new(width, height);
+@@ -71,7 +92,7 @@ pub(crate) fn make_device(
+     let device_size = euclid::Size2D::new(width, height) * scale;
+     let device_pixel_ratio = euclid::Scale::new(scale);
+ 
+-    Device::new(
++    let mut device = Device::new(
+         media_type,
+         QuirksMode::NoQuirks,
+         viewport_size,
+@@ -85,5 +106,17 @@ pub(crate) fn make_device(
+         },
+         PointerCapabilities::default(),
+         PointerCapabilities::default(),
+-    )
++    );
++    device.set_prefers_reduced_motion(if preferences.reduced_motion {
++        PrefersReducedMotion::Reduce
++    } else {
++        PrefersReducedMotion::NoPreference
++    });
++    device.set_prefers_contrast(match preferences.contrast {
++        Contrast::NoPreference => PrefersContrast::NoPreference,
++        Contrast::More => PrefersContrast::More,
++        Contrast::Less => PrefersContrast::Less,
++        Contrast::Custom => PrefersContrast::Custom,
++    });
++    device
+ }

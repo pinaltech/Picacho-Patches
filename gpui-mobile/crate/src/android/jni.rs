@@ -1316,6 +1316,7 @@ pub fn show_keyboard_android(keyboard_type: crate::KeyboardType) {
         crate::KeyboardType::NumberPad => 3,
         crate::KeyboardType::URL => 4,
         crate::KeyboardType::Decimal => 5,
+        crate::KeyboardType::Password => 6,
     };
     let session = super::text_input::new_session();
     if let Err(error) = with_env(|env| {

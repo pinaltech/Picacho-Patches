@@ -154,10 +154,28 @@ pub fn walk_tree(indent: usize, node: &Node) {
 }
 
 /// Parse an SVG image.
+///
+/// Documents' SVG comes from anyone: an `<image>` loads nothing it names
+/// but a picture inside the SVG (a `data:` URL). usvg's default string
+/// resolver reads any path named from disk (`std::fs::read`), whatever
+/// `resources_dir`, past the document's net provider: local files shown,
+/// device files (`/dev/zero`) read without end, and on Windows a UNC path
+/// (`\\host\share\x.png`) opened over SMB, handing that host the user's
+/// NTLM hash. Nor does an SVG inside inflate gzip, which usvg does to its end.
 #[cfg(feature = "svg")]
 pub(crate) fn parse_svg_image(source: &[u8]) -> Result<crate::node::SvgImageData, usvg::Error> {
     let options = usvg::Options {
+        resources_dir: None,
         fontdb: Arc::clone(&*FONT_DB),
+        image_href_resolver: usvg::ImageHrefResolver {
+            resolve_data: Box::new(|mime, data, options| {
+                if data.starts_with(&[0x1f, 0x8b]) {
+                    return None;
+                }
+                (usvg::ImageHrefResolver::default_data_resolver())(mime, data, options)
+            }),
+            resolve_string: Box::new(|_, _| None),
+        },
         ..Default::default()
     };
     crate::node::SvgImageData::from_data(source, &options)
@@ -180,6 +198,28 @@ impl ToColorColor for AbsoluteColor {
 #[cfg(all(test, feature = "svg"))]
 mod svg_tests {
     use super::parse_svg_image;
+
+    /// An `<image>` naming a file loads nothing: usvg's default would read it.
+    #[test]
+    fn images_naming_files_are_not_read() {
+        let path = std::env::temp_dir().join(format!("blitz-svg-{}.png", std::process::id()));
+        // A 1×1 PNG.
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+            0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+            0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+            0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+            0x42, 0x60, 0x82,
+        ];
+        std::fs::write(&path, PNG).unwrap();
+        let src = format!(
+            r#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><image href="{}" width="2" height="2"/></svg>"#,
+            path.display()
+        );
+        let svg = parse_svg_image(src.as_bytes()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(!svg.tree.root().has_children(), "the file was read");
+    }
 
     #[test]
     fn svg_without_xmlns_parses() {

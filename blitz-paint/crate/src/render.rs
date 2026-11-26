@@ -673,6 +673,25 @@ fn to_image_quality(image_rendering: ImageRendering) -> peniko::ImageQuality {
 }
 
 /// The transform from an SVG's rendered tree to a viewport of the given size.
+/// Draws an SVG image (an `<img>`'s or a CSS image layer's) inside a layer
+/// that [`crate::is_image_layer`] recognizes, clipped to the image's viewport.
+#[cfg(feature = "svg")]
+pub(crate) fn render_svg_image(scene: &mut impl PaintScene, tree: &usvg::Tree, transform: Affine) {
+    let size = tree.size();
+    let clip = Rect::new(0.0, 0.0, size.width() as f64, size.height() as f64);
+    scene.push_layer(
+        crate::IMAGE_LAYER_FILL,
+        peniko::Mix::Normal,
+        1.0,
+        transform,
+        &clip,
+        None,
+        None,
+    );
+    anyrender_svg::render_svg_tree(scene, tree, transform);
+    scene.pop_layer();
+}
+
 #[cfg(feature = "svg")]
 fn svg_viewport_affine(svg: &blitz_dom::node::SvgImageData, width: f32, height: f32) -> Affine {
     let t = svg.viewport_transform(width, height);
@@ -1141,7 +1160,7 @@ impl ElementCx<'_, '_> {
             x_offset.px(),
             y_offset.px(),
             |scene| {
-                anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
+                render_svg_image(scene, &svg.tree, transform);
             },
         );
     }

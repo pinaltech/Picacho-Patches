@@ -1,0 +1,79 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index afae3e2..c4846f8 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -28,6 +28,22 @@ const FONT_EMBOLDEN_ENABLED: bool = cfg!(any(
+ /// The default color for text selection highlights
+ const SELECTION_COLOR: Color = Color::from_rgb8(180, 213, 255);
+ 
++/// The fill rule of the layer every SVG image is drawn in (see
++/// [`is_image_layer`]). Nothing else pushes an even-odd layer.
++const IMAGE_LAYER_FILL: peniko::Fill = peniko::Fill::EvenOdd;
++
++/// Whether a recorded layer holds an image's own drawing: an SVG image's
++/// shapes, which unlike a raster image are recorded as ordinary fills and
++/// strokes. A consumer that recolors the document's drawing (for dark
++/// reading, say) can leave what is inside such a layer alone, as it leaves
++/// raster images.
++pub fn is_image_layer(layer: &anyrender::recording::LayerCommand) -> bool {
++    layer.fill == IMAGE_LAYER_FILL
++        && layer.alpha == 1.0
++        && layer.filter.is_none()
++        && layer.backdrop_filter.is_none()
++}
++
+ /// Pre-computed `Scene`s for each CustomWidget, keyed by `(document id, node id)`
+ type CustomWidgetSceneMap = HashMap<(usize, NodeId), Scene>;
+ 
+diff --git a/src/render/background.rs b/src/render/background.rs
+index 943d2f5..8c7e27b 100644
+--- a/src/render/background.rs
++++ b/src/render/background.rs
+@@ -462,7 +462,7 @@ impl ElementCx<'_, '_> {
+             ))
+             * viewport;
+ 
+-        anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
++        super::render_svg_image(scene, &svg.tree, transform);
+     }
+ 
+     fn draw_raster_image_layer(&self, scene: &mut impl PaintScene, layer: &ImageLayerStyles) {
+diff --git a/src/render.rs b/src/render.rs
+index 407fd1a..2243d28 100644
+--- a/src/render.rs
++++ b/src/render.rs
+@@ -673,6 +673,25 @@ fn to_image_quality(image_rendering: ImageRendering) -> peniko::ImageQuality {
+ }
+ 
+ /// The transform from an SVG's rendered tree to a viewport of the given size.
++/// Draws an SVG image (an `<img>`'s or a CSS image layer's) inside a layer
++/// that [`crate::is_image_layer`] recognizes, clipped to the image's viewport.
++#[cfg(feature = "svg")]
++pub(crate) fn render_svg_image(scene: &mut impl PaintScene, tree: &usvg::Tree, transform: Affine) {
++    let size = tree.size();
++    let clip = Rect::new(0.0, 0.0, size.width() as f64, size.height() as f64);
++    scene.push_layer(
++        crate::IMAGE_LAYER_FILL,
++        peniko::Mix::Normal,
++        1.0,
++        transform,
++        &clip,
++        None,
++        None,
++    );
++    anyrender_svg::render_svg_tree(scene, tree, transform);
++    scene.pop_layer();
++}
++
+ #[cfg(feature = "svg")]
+ fn svg_viewport_affine(svg: &blitz_dom::node::SvgImageData, width: f32, height: f32) -> Affine {
+     let t = svg.viewport_transform(width, height);
+@@ -1141,7 +1160,7 @@ impl ElementCx<'_, '_> {
+             x_offset.px(),
+             y_offset.px(),
+             |scene| {
+-                anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
++                render_svg_image(scene, &svg.tree, transform);
+             },
+         );
+     }

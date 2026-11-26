@@ -1,0 +1,79 @@
+diff --git a/src/document.rs b/src/document.rs
+index b8fd12c..3adf016 100644
+--- a/src/document.rs
++++ b/src/document.rs
+@@ -242,6 +242,9 @@ pub struct BaseDocument {
+     /// last [`resolve`](Self::resolve), to be applied (coalesced into a single
+     /// device rebuild) at the start of the next resolve.
+     pub(crate) pending_device_changes: DeviceChanges,
++    /// The device pixel ratio `@media` rules see, when it isn't the
++    /// viewport's scale (see [`Self::set_media_device_pixel_ratio`]).
++    pub(crate) media_device_pixel_ratio: Option<f32>,
+     /// Strategy for Stylo's style traversal during `resolve`.
+     pub(crate) style_threading: StyleThreading,
+     /// Whether incremental layout is enabled for this document. When disabled,
+@@ -440,7 +443,7 @@ impl BaseDocument {
+ 
+         let viewport = config.viewport.unwrap_or_default();
+         let media_type = config.media_type.unwrap_or_else(MediaType::screen);
+-        let device = make_device(&viewport, media_type.clone(), font_ctx.clone());
++        let device = make_device(&viewport, media_type.clone(), font_ctx.clone(), None);
+         let stylist = Stylist::new(device, QuirksMode::NoQuirks);
+         let snapshots = SnapshotMap::new();
+         let nodes = Box::new(NodeTree::new());
+@@ -482,6 +485,7 @@ impl BaseDocument {
+             viewport,
+             media_type,
+             pending_device_changes: DeviceChanges::empty(),
++            media_device_pixel_ratio: None,
+             style_threading: config.style_threading,
+             incremental_layout: config.incremental.unwrap_or(true),
+             subdocument_depth: config.subdocument_depth,
+@@ -2002,6 +2006,19 @@ impl BaseDocument {
+         self.queue_device_changes(DeviceChanges::MEDIA_TYPE);
+     }
+ 
++    /// Sets the device pixel ratio that `resolution` and
++    /// `-webkit-device-pixel-ratio` media queries see, for an embedder that
++    /// lays the document out in CSS pixels (a viewport scale of 1) and
++    /// rasterizes it at the screen's scale itself. `None` uses the viewport's
++    /// scale, as before.
++    pub fn set_media_device_pixel_ratio(&mut self, ratio: Option<f32>) {
++        if self.media_device_pixel_ratio == ratio {
++            return;
++        }
++        self.media_device_pixel_ratio = ratio;
++        self.queue_device_changes(DeviceChanges::MEDIA_TYPE);
++    }
++
+     pub fn viewport(&self) -> &Viewport {
+         &self.viewport
+     }
+@@ -2102,6 +2119,7 @@ impl BaseDocument {
+             &self.viewport,
+             self.media_type.clone(),
+             self.font_ctx.clone(),
++            self.media_device_pixel_ratio,
+         ));
+         self.scroll_viewport_by(0.0, 0.0); // Clamp scroll offset
+ 
+diff --git a/src/stylo_device.rs b/src/stylo_device.rs
+index ab3ebe1..6f95d84 100644
+--- a/src/stylo_device.rs
++++ b/src/stylo_device.rs
+@@ -63,11 +63,13 @@ pub(crate) fn make_device(
+     viewport: &Viewport,
+     media_type: MediaType,
+     font_ctx: Arc<Mutex<FontContext>>,
++    media_device_pixel_ratio: Option<f32>,
+ ) -> Device {
+     let (width, height) = viewport.logical_size();
+     let viewport_size = euclid::Size2D::new(width, height);
+-    let device_size = euclid::Size2D::new(width, height) * viewport.scale();
+-    let device_pixel_ratio = euclid::Scale::new(viewport.scale());
++    let scale = media_device_pixel_ratio.unwrap_or(viewport.scale());
++    let device_size = euclid::Size2D::new(width, height) * scale;
++    let device_pixel_ratio = euclid::Scale::new(scale);
+ 
+     Device::new(
+         media_type,

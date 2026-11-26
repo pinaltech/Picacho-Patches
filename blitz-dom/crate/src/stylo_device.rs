@@ -14,7 +14,7 @@ use style::device::Device;
 use style::media_queries::MediaType;
 use style::properties::ComputedValues;
 use style::properties::style_structs::Font;
-use style::queries::values::PrefersColorScheme;
+use style::queries::values::{PrefersColorScheme, PrefersContrast, PrefersReducedMotion};
 use style::servo::media_features::PointerCapabilities;
 
 use crate::font_metrics::BlitzFontMetricsProvider;
@@ -59,17 +59,40 @@ impl DeviceChanges {
     }
 }
 
+/// What the user prefers, as `prefers-reduced-motion` and
+/// `prefers-contrast` media queries see it (Media Queries 5 §11.3, §11.4).
+/// The embedder knows these from its own settings or the system; the
+/// default is "no preference" for both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MediaPreferences {
+    pub reduced_motion: bool,
+    pub contrast: Contrast,
+}
+
+/// The `prefers-contrast` values (Media Queries 5 §11.4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Contrast {
+    #[default]
+    NoPreference,
+    More,
+    Less,
+    Custom,
+}
+
 pub(crate) fn make_device(
     viewport: &Viewport,
     media_type: MediaType,
     font_ctx: Arc<Mutex<FontContext>>,
+    media_device_pixel_ratio: Option<f32>,
+    preferences: MediaPreferences,
 ) -> Device {
     let (width, height) = viewport.logical_size();
     let viewport_size = euclid::Size2D::new(width, height);
-    let device_size = euclid::Size2D::new(width, height) * viewport.scale();
-    let device_pixel_ratio = euclid::Scale::new(viewport.scale());
+    let scale = media_device_pixel_ratio.unwrap_or(viewport.scale());
+    let device_size = euclid::Size2D::new(width, height) * scale;
+    let device_pixel_ratio = euclid::Scale::new(scale);
 
-    Device::new(
+    let mut device = Device::new(
         media_type,
         QuirksMode::NoQuirks,
         viewport_size,
@@ -83,5 +106,17 @@ pub(crate) fn make_device(
         },
         PointerCapabilities::default(),
         PointerCapabilities::default(),
-    )
+    );
+    device.set_prefers_reduced_motion(if preferences.reduced_motion {
+        PrefersReducedMotion::Reduce
+    } else {
+        PrefersReducedMotion::NoPreference
+    });
+    device.set_prefers_contrast(match preferences.contrast {
+        Contrast::NoPreference => PrefersContrast::NoPreference,
+        Contrast::More => PrefersContrast::More,
+        Contrast::Less => PrefersContrast::Less,
+        Contrast::Custom => PrefersContrast::Custom,
+    });
+    device
 }

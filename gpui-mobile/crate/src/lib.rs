@@ -229,6 +229,9 @@ pub enum KeyboardType {
     URL,
     /// Decimal number pad (digits and decimal point).
     Decimal,
+    /// A password, PIN or passphrase: hidden, with no suggestions, and kept
+    /// out of the keyboard's learning and history (and their cloud sync).
+    Password,
 }
 
 /// Show the software keyboard with the default keyboard type.

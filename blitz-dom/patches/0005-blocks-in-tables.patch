@@ -1,0 +1,65 @@
+Blocks directly in a table or row group are laid out in an anonymous row and cell of their own, rather than dropped.
+
+diff --git a/src/layout/table.rs b/src/layout/table.rs
+index 293ca58..d151ccb 100644
+--- a/src/layout/table.rs
++++ b/src/layout/table.rs
+@@ -132,6 +132,10 @@ pub struct TableRow {
+     /// specified length `height`. Such rows do not receive excess table height when there
+     /// are unconstrained rows to receive it instead.
+     pub is_constrained: bool,
++    /// An anonymous row around a block box directly in the table or a row group
++    /// (see `collect_table_cells`): `node_id` is that box, whose background is
++    /// its own, not a row's.
++    pub anonymous: bool,
+ }
+ 
+ /// The used width of one border side: border widths are not adjusted for
+@@ -579,8 +583,9 @@ fn collect_table_cells(
+             // `display: contents` is transparent: its children are where it is.
+             let children_in_row = in_row && display.inside() == DisplayInside::Contents;
+             for child_id in children.iter().copied() {
+-                // A child taken as a cell is laid out (constructed) as one.
+-                if !(children_in_row && is_anonymous_cell(doc, child_id)) {
++                // A child taken as a cell (in a row, or in an anonymous row of
++                // its own) is laid out (constructed) as one.
++                if !is_anonymous_cell(doc, child_id) {
+                     doc.nodes[child_id]
+                         .remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+                 }
+@@ -622,6 +627,7 @@ fn collect_table_cells(
+                 group: None,
+                 height,
+                 is_constrained: height.is_some(),
++                anonymous: false,
+             });
+ 
+             let children = std::mem::take(&mut doc.nodes[node_id].children);
+@@ -647,10 +653,23 @@ fn collect_table_cells(
+         }
+         // A block or inline box directly in a row is wrapped in an anonymous
+         // cell in CSS (emails restack rows by making cells `display: block`);
+-        // Blitz lays it out as that cell.
+-        inside
+-            if inside == DisplayInside::TableCell || (in_row && is_anonymous_cell_display(display)) =>
+-        {
++        // Blitz lays it out as that cell. Directly in a table or row group
++        // (cells made `display: block` in a `display: table` without rows) it
++        // is wrapped in an anonymous row and cell: Blitz gives it a row of its
++        // own, so restacked columns stack rather than vanish.
++        inside if inside == DisplayInside::TableCell || is_anonymous_cell_display(display) => {
++            if inside != DisplayInside::TableCell && !in_row {
++                *row += 1;
++                cursor.start_row();
++                rows.push(TableRow {
++                    node_id,
++                    group: None,
++                    height: None,
++                    is_constrained: false,
++                    anonymous: true,
++                });
++            }
++            let node = &mut doc.nodes[node_id];
+             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
+             let stylo_style = &node.primary_styles().unwrap();
+             let colspan: u16 = node

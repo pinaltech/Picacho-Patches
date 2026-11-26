@@ -69,6 +69,7 @@ pub enum StatusAttribute {
     UidNext(u32),
     UidValidity(u32),
     Unseen(u32),
+    Size(u64), // RFC 8438 (Picacho patch)
 }
 
 #[derive(Debug, Eq, PartialEq)]

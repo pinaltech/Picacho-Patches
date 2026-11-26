@@ -76,6 +76,7 @@ pub use resolved_style::{
     css_property_is_supported, parse_transform_matrix, resolved_style_property_names,
 };
 pub use stylo_to_kurbo::resolve_2d_transform;
+pub use stylo_device::{Contrast, MediaPreferences};
 
 pub mod net;
 pub mod util;

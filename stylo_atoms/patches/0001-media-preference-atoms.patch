@@ -1,0 +1,15 @@
+Atoms for the prefers-reduced-motion and prefers-contrast media features.
+
+diff --git a/static_atoms.txt b/static_atoms.txt
+index a5f6b97..9ee327f 100644
+--- a/static_atoms.txt
++++ b/static_atoms.txt
+@@ -124,6 +124,8 @@ pointer
+ popstate
+ postershown
+ prefers-color-scheme
++prefers-contrast
++prefers-reduced-motion
+ print
+ progress
+ radio

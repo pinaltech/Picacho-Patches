@@ -273,6 +273,12 @@ named!(status_att<StatusAttribute>, alt!(
         tag_no_case!("UNSEEN ") >>
         val: number >>
         (StatusAttribute::Unseen(val))
+    ) |
+    // STATUS=SIZE (RFC 8438, Picacho patch): the mailbox's size in octets.
+    do_parse!(
+        tag_no_case!("SIZE ") >>
+        val: number_64 >>
+        (StatusAttribute::Size(val))
     )
 ));
 
@@ -558,6 +564,9 @@ named!(resp_other<Response>, map_res!(
             tag_no_case!("LISTRIGHTS") |
             tag_no_case!("ACL") |
             tag_no_case!("ID") |
+            // Picacho patch 0007: URLAUTH's GENURLAUTH and URLFETCH (RFC 4467).
+            tag_no_case!("GENURLAUTH") |
+            tag_no_case!("URLFETCH") |
             tag_no_case!("ENABLED")
         ),
         text
@@ -644,6 +653,23 @@ mod tests {
                 let body = &attrs[0];
                 assert!(if let AttributeValue::BodyStructure(_) = *body { true } else { false }, "body = {:?}", body);
             },
+            rsp => panic!("unexpected response {:?}", rsp),
+        }
+    }
+
+    #[test]
+    fn test_status_size_and_urlauth() {
+        match parse_response(b"* STATUS \"Sent Items\" (MESSAGES 3 SIZE 6442450944)\r\n") {
+            Ok((_, Response::MailboxData(MailboxDatum::Status { status, .. }))) => {
+                assert_eq!(status, [
+                    StatusAttribute::Messages(3),
+                    StatusAttribute::Size(6_442_450_944),
+                ]);
+            },
+            rsp => panic!("unexpected response {:?}", rsp),
+        }
+        match parse_response(b"* GENURLAUTH \"imap://a@h/S;UIDVALIDITY=1/;UID=2;urlauth=submit+a:internal:00\"\r\n") {
+            Ok((_, Response::Other(line))) => assert!(line.starts_with("GENURLAUTH \"imap://")),
             rsp => panic!("unexpected response {:?}", rsp),
         }
     }

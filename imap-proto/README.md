@@ -62,6 +62,15 @@ where missing, so `imap` 2.4's `uid_fetch` and `uid_store` read it as a UID
 FETCH reply (and pass it over as unilateral data elsewhere). Without it,
 `imap` takes the response for the server hanging up.
 
+### 0007 STATUS=SIZE and URLAUTH
+
+`StatusAttribute::Size(u64)`: STATUS=SIZE (RFC 8438) reports a mailbox's size
+in octets, in STATUS and LIST-STATUS replies. Untagged `GENURLAUTH` and
+`URLFETCH` (URLAUTH, RFC 4467) are kept as `Response::Other` text, as patch
+0002 keeps others. Without them, `imap` 2.4 can't read these replies, and
+Picacho can't add up storage on servers without QUOTA, or have its outgoing
+server fetch a message it filed (BURL).
+
 Remove these patches when Picacho moves to an `imap`/`imap-proto` release that
 parses this data.
 
